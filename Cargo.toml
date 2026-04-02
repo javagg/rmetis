@@ -1,0 +1,38 @@
+[package]
+name = "rmetis"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Pure Rust graph partitioning library, compatible with METIS 5.1.x, compilable to WebAssembly"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rand = { version = "0.8", default-features = false, features = ["small_rng"] }
+getrandom = { version = "0.2", features = ["js"], optional = true }
+priority-queue = "1.3"
+thiserror = "1"
+wasm-bindgen = { version = "0.2", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+rayon = { version = "1", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[features]
+default = ["std"]
+std = ["rand/std", "rand/std_rng"]
+c-api = []
+wasm = ["wasm-bindgen", "serde", "serde-wasm-bindgen", "getrandom"]
+parallel = ["dep:rayon"]
+
+[[bench]]
+name = "partition"
+harness = false
+
+[profile.release]
+lto = true
+opt-level = 3
