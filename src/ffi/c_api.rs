@@ -188,7 +188,7 @@ unsafe fn c_partition_impl(
     };
 
     let result = if kway {
-        kway::partition_kway(&graph, np, tpwgts_opt, ubvec_opt, &opts)
+        kway::partition_kway(&graph, np, tpwgts_opt, ubvec_opt, &opts, None)
     } else {
         recursive::partition_recursive(&graph, np, tpwgts_opt, ubvec_opt, &opts)
     };

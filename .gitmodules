@@ -1,0 +1,3 @@
+[submodule "vendor/jsmpi"]
+	path = vendor/jsmpi
+	url = https://github.com/jsmpi/jsmpi.git

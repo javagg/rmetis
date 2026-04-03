@@ -29,6 +29,12 @@ c-api = []
 wasm = ["wasm-bindgen", "serde", "serde-wasm-bindgen", "getrandom"]
 parallel = ["dep:rayon"]
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+jsmpi = { path = "vendor/jsmpi" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+mpi = "0.8"
+
 [[bench]]
 name = "partition"
 harness = false

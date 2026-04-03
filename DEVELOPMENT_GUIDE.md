@@ -1,6 +1,6 @@
 # rmetis 设计开发指南
 
-> 面向 AI Agent 的开发指导文档 | 版本: 0.1.0 | 日期: 2026-04-02
+> 面向 AI Agent 的开发指导文档 | 版本: 0.1.1 | 日期: 2026-04-03
 
 ## 1. 项目目标与约束
 
@@ -54,16 +54,17 @@
 
 ### Phase 3：API 层
 
-- [ ] **P3.1** 实现 C ABI 兼容层（`c-api` feature）
-- [ ] **P3.2** 实现 WASM/JS 绑定（`wasm` feature，wasm-bindgen）
+- [x] **P3.1** 实现 C ABI 兼容层（`c-api` feature）
+- [x] **P3.2** 实现 WASM/JS 绑定（`wasm` feature，wasm-bindgen）
 - [ ] **P3.3** 编写 TypeScript 类型声明文件
 
 ### Phase 4：质量与性能
 
 - [ ] **P4.1** 添加 fuzzing（cargo-fuzz）
 - [ ] **P4.2** 添加 benchmark（criterion）
-- [ ] **P4.3** 可选并行支持（rayon，`parallel` feature）
-- [ ] **P4.4** WASM 尺寸优化（wasm-opt）
+- [x] **P4.3** MPI 并行支持（ParMETIS 风格：并行 ncuts + 分布式粗化 + 分布式贪心细化）
+- [ ] **P4.4** 可选共享内存并行（rayon，`parallel` feature）
+- [ ] **P4.5** WASM 尺寸优化（wasm-opt）
 
 ---
 
@@ -144,31 +145,26 @@ Graph  →  [Matcher]  →  matching: Vec<Idx>  →  [build_coarse_graph]  →  
 
 ```rust
 // coarsen/mod.rs
-pub fn coarsen(graph: &Graph, options: &Options) -> Vec<CoarseGraph> {
-    // 返回从细到粗的图层次（graph[0] 最细，graph.last() 最粗）
-    let mut levels = vec![];
-    let mut current = graph.clone();
-    
-    loop {
-        let coarse = match options.ctype {
-            CType::Rm   => rm::coarsen_step(&current),
-            CType::Shem => shem::coarsen_step(&current),
-        };
-        
-        // 停止条件
-        let ratio = coarse.graph.nvtxs as f32 / current.nvtxs as f32;
-        let threshold = (20 * nparts).max(options.coarsen_limit);
-        
-        levels.push(coarse.clone());
-        
-        if coarse.graph.nvtxs <= threshold || ratio > 0.95 {
-            break;
-        }
-        current = coarse.graph;
-    }
-    levels
-}
+/// 串行粗化（委托给 coarsen_with_comm + SingleComm）
+pub fn coarsen(graph: &Graph, nparts: usize, options: &Options, rng: &mut impl Rng) -> Vec<CoarseLevel>
 
+/// MPI 并行粗化
+/// 当 comm.size() > 1 时使用分布式匹配（parallel_matching），
+/// 否则退化为串行匹配（rm/shem）。
+pub fn coarsen_with_comm(
+    graph: &Graph,
+    nparts: usize,
+    options: &Options,
+    rng: &mut impl Rng,
+    comm: &dyn Comm,
+) -> Vec<CoarseLevel>
+
+/// 分布式匹配：每个进程为 v%nprocs==rank 的顶点提议匹配，
+/// 通过 all_gather_i32_vec 交换提议，lowest-rank-wins 解决冲突。
+fn parallel_matching(graph: &Graph, comm: &dyn Comm, rng: &mut impl Rng) -> Vec<usize>
+```
+
+```rust
 // build_coarse_graph 中的注意事项：
 // 1. 超顶点权重 = 两个匹配顶点权重之和（多约束时每个维度独立相加）
 // 2. 边去重时：同一对超顶点间的多条边合并为一条，权重相加
@@ -243,6 +239,40 @@ impl<'a> FmRefiner<'a> {
 // 数据结构：Vec<HashMap<PartId, Idx>> 或 Vec<BTreeMap<PartId, Idx>>
 ```
 
+**greedy.rs（贪心细化 + MPI 并行）：**
+
+```rust
+/// 串行贪心细化（委托给 greedy_refine_with_comm + SingleComm）
+pub fn greedy_refine(
+    graph: &Graph,
+    part: &mut Vec<Idx>,
+    nparts: usize,
+    tpwgts: &[f64],
+    ubvec: &[f64],
+    niter: usize,
+) -> Idx
+
+/// MPI 并行贪心细化
+/// 阶段一（平衡修复）：允许将顶点从超重分区移出，即使切割增加也允许。
+///   - 只有当前分区超重时才考虑移动该顶点。
+///   - 选择所有可行目标中增益最高（或最小负增益）的目标。
+/// 阶段二（切割优化，循环 niter 次）：仅允许正增益且满足平衡约束的移动。
+/// 两个阶段均通过 all_gather_i32_vec 原子交换提议移动。
+pub fn greedy_refine_with_comm(
+    graph: &Graph,
+    part: &mut Vec<Idx>,
+    nparts: usize,
+    tpwgts: &[f64],
+    ubvec: &[f64],
+    niter: usize,
+    comm: &dyn Comm,
+) -> Idx
+
+// 重要：平衡修复 pass 必须在切割优化循环之前运行，
+// 确保主循环开始时分区已处于平衡状态。
+// 这解决了 FM 细化无法处理严重失衡初始划分的问题。
+```
+
 ### 3.6 模块 `partition/`
 
 **recursive.rs：**
@@ -270,23 +300,35 @@ pub fn partition_recursive(
 **kway.rs：**
 
 ```rust
+/// 多层 k-way 划分，支持 MPI 并行。
+///
+/// comm = None 或 SingleComm：串行执行所有 ncuts 次尝试。
+/// comm = Some(&world)（size > 1）：
+///   - 进程 r 执行尝试编号 r, r+P, r+2P, ... （并行 ncuts）
+///   - 粗化使用 coarsen_with_comm（分布式匹配）
+///   - 贪心细化使用 greedy_refine_with_comm（分布式细化）
+///   - 最终通过 all_reduce_min + gather + broadcast 选出全局最优划分
 pub fn partition_kway(
     graph: &Graph,
     nparts: usize,
-    ...
-) -> Result<PartitionResult, MetisError> {
-    // 1. 多层粗化（同 recursive）
-    // 2. 初始划分：直接在粗化图上做 k-way 初始划分
-    //    - 使用 grow_partition 或 random_partition
-    // 3. 细化：使用 K-way FM 或 Greedy
-    // 4. 投影：将粗化图划分逐层投影回原始图
-    
-    // 投影算法：
-    // for each level from coarsest to finest:
-    //   for each vertex v in fine graph:
-    //     part[v] = coarse_part[cmap[v]]
-    //   refine on fine graph
-}
+    tpwgts: Option<&[Real]>,
+    ubvec: Option<&[Real]>,
+    options: &Options,
+    comm: Option<&dyn Comm>,  // None → 退化为 SingleComm（串行）
+) -> Result<PartitionResult, MetisError>
+
+/// 内部辅助：按 options.rtype 分派细化算法
+/// Greedy → greedy_refine_with_comm（支持 comm）
+/// FM → refine_kway（串行，不使用 comm）
+fn refine_level(
+    graph: &Graph,
+    part: &mut Vec<Idx>,
+    nparts: usize,
+    tpwgts: &[f64],
+    ubvec: &[f64],
+    options: &Options,
+    comm: &dyn Comm,
+)
 ```
 
 ### 3.7 模块 `separator/mod.rs`
@@ -359,6 +401,44 @@ pub fn part_graph_kway(
     options_json: Option<String>,  // JSON 字符串传递 Options
 ) -> Result<JsValue, JsValue>  // 返回 {part: Int32Array, objval: number}
 ```
+
+### 3.10 模块 `comm.rs`
+
+**职责**：提供统一的 MPI 通信抽象，屏蔽 SingleComm / jsmpi / mpi 三种后端。
+
+```rust
+// 三种后端及选择规则：
+//
+// 1. SingleComm（struct，no-op）
+//    - 所有操作均为本地操作或恒等变换
+//    - rank() = 0, size() = 1
+//    - 不依赖任何 MPI 库，始终可用
+//
+// 2. jsmpi 后端（cfg: target_arch = "wasm32"）
+//    - 通过 Web Worker 消息传递实现 MPI 语义
+//    - 原生只支持 sum-reduce；min-reduce 需通过 gather + local-min + broadcast 实现
+//    - all_gather 通过多轮 gather/broadcast 模拟
+//
+// 3. mpi 后端（cfg: not(target_arch = "wasm32")）
+//    - 封装 mpi crate 0.8（bsteinb/rsmpi）
+//    - 需要系统安装 OpenMPI 或 MPICH
+//    - 注意：调用 universe.world().size() 前需 use mpi::topology::Communicator
+//    - all_gather_i32_vec 使用 all_gather_varcount_into_root 实现变长收集
+
+pub fn world() -> Box<dyn Comm> {
+    // 1. 初始化 MPI 环境
+    // 2. 若 size == 1，返回 Box::new(SingleComm) 避免 MPI 开销
+    // 3. 否则返回 Box::new(MpiComm { universe, world })
+}
+```
+
+**关键实现陷阱：**
+
+| 问题 | 原因 | 解决方案 |
+|------|------|---------|
+| `universe.world().size()` 方法找不到 | `size()` 在 `Communicator` trait 中，未导入 | `use mpi::topology::Communicator as MpiCommunicator;` |
+| `gather_into` 签名错误 | 非 root 调用 `gather_into(sendbuf)`，root 调用 `gather_into_root(sendbuf, recvbuf)` | 根据 `rank == root` 分支调用 |
+| SHEM 排序非确定性 | `sort_by_key` 对同一元素多次调用闭包，`rng.gen()` 每次返回不同值，违反全序 | 排序前预采样 tiebreakers `Vec<u32>` |
 
 ---
 
@@ -508,7 +588,39 @@ fn test_4elt_kway_k8() {
 }
 ```
 
-### 5.3 回归测试（tests/regression.rs）
+### 5.3 并行测试（tests/parallel.rs）
+
+所有测试使用 `SingleComm`，无需真实 MPI 环境即可运行：
+
+```rust
+// Comm trait 基础测试
+#[test] fn single_comm_rank_and_size() { ... }
+#[test] fn single_comm_all_reduce_min_is_identity() { ... }
+#[test] fn single_comm_all_reduce_sum_slice_is_copy() { ... }
+#[test] fn single_comm_gather_returns_single_row() { ... }
+#[test] fn single_comm_all_gather_returns_single_row() { ... }
+#[test] fn single_comm_broadcast_is_noop() { ... }
+
+// 算法 + comm 集成测试
+#[test] fn greedy_refine_with_single_comm_matches_serial() {
+    // 验证 greedy_refine 和 greedy_refine_with_comm(&SingleComm) 结果完全相同
+}
+#[test] fn greedy_refine_with_comm_does_not_increase_cut() { ... }
+#[test] fn coarsen_with_single_comm_produces_valid_hierarchy() {
+    // 验证层次结构中每层图规模严格缩小，且 cmap 范围合法
+}
+
+// partition_kway MPI 接口测试
+#[test] fn partition_kway_with_explicit_single_comm_is_valid() { ... }
+#[test] fn partition_kway_with_none_comm_matches_explicit_single_comm() {
+    // 验证 comm=None 与 comm=Some(&SingleComm) 产生相同结果
+}
+#[test] fn partition_kway_parallel_ncuts_covers_all_attempts() {
+    // 验证 ncuts 次尝试全部被执行（通过计数器或固定 seed 验证）
+}
+```
+
+### 5.4 回归测试（tests/regression.rs）
 
 ```rust
 // 固定 seed，验证边割数的确定性
@@ -525,7 +637,7 @@ fn test_deterministic_output() {
 }
 ```
 
-### 5.4 辅助断言函数
+### 5.5 辅助断言函数
 
 ```rust
 // tests/common.rs
@@ -818,22 +930,27 @@ criterion_main!(benches);
 AI Agent 按以下顺序依次实现，每个步骤完成后运行 `cargo test` 确认无回归：
 
 ```
-1. types.rs          → 类型和错误定义
-2. graph/validate.rs → CSR 验证逻辑
-3. graph/mod.rs      → Graph 结构体和基本方法
-4. coarsen/rm.rs     → 随机匹配粗化
-5. initial/grow.rs   → 图增长初始划分
-6. refine/greedy.rs  → 贪心细化
-7. partition/kway.rs → K-way 多层框架（先用贪心细化）
-8. tests/correctness → 第一批集成测试
-9. coarsen/shem.rs   → SHEM 粗化（替换 RM）
-10. refine/fm.rs     → 2-way FM 细化
+1.  types.rs          → 类型和错误定义
+2.  graph/validate.rs → CSR 验证逻辑
+3.  graph/mod.rs      → Graph 结构体和基本方法
+4.  coarsen/rm.rs     → 随机匹配粗化
+5.  initial/grow.rs   → 图增长初始划分
+6.  refine/greedy.rs  → 贪心细化（含平衡修复 pass）
+7.  partition/kway.rs → K-way 多层框架（先用贪心细化）
+8.  tests/correctness → 第一批集成测试
+9.  coarsen/shem.rs   → SHEM 粗化（含确定性平局打破）
+10. refine/fm.rs      → 2-way FM 细化
 11. partition/recursive.rs → 递归二分
 12. refine/fm_kway.rs → K-way FM
 13. separator/mod.rs  → 顶点分隔符
 14. partition/nd.rs   → NodeND
 15. ffi/c_api.rs      → C ABI 层
 16. ffi/wasm_api.rs   → WASM 绑定
+17. comm.rs           → MPI 通信抽象（SingleComm + jsmpi + mpi 后端）
+18. coarsen/mod.rs    → coarsen_with_comm（分布式粗化）
+19. refine/greedy.rs  → greedy_refine_with_comm（分布式细化）
+20. partition/kway.rs → partition_kway comm 参数（并行 ncuts）
+21. tests/parallel.rs → MPI 并行测试（全基于 SingleComm）
 ```
 
 ## 附录 B：标准测试图
@@ -873,3 +990,7 @@ fn binary_tree() -> Graph { ... }
 | FM 增益更新 | 移动顶点后必须更新所有邻居增益 | 不要忘记更新锁定顶点的邻居 |
 | 粗化图节点数 | 孤立匹配顶点也必须成为超顶点 | matching[-1] 的顶点自映射 |
 | WASM 无 panic | wasm32 的 panic 会终止整个 wasm 实例 | 所有公开函数用 Result 返回，不 unwrap |
+| SHEM sort 非确定性 | `sort_by_key` 在闭包内调用 `rng.gen()` → 同元素得到不同 key → 排序违反全序 → panic 或 UB | 排序前预采样所有平局打破值至 `Vec<u32>` |
+| `size()` 方法找不到 | mpi crate 的 `size()` 在 `Communicator` trait 中 | `use mpi::topology::Communicator as MpiCommunicator;` |
+| `gather_into` 签名 | mpi crate 非 root 调用 `gather_into(buf)`，root 调用 `gather_into_root(send, recv)` | 根据 `rank == root` 分支选择方法 |
+| Greedy 无法修复平衡 | 原版 greedy 只允许正增益移动，严重失衡的初始划分无法修复 | 在切割优化循环前先运行平衡修复 pass |

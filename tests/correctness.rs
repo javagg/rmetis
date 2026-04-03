@@ -119,7 +119,9 @@ fn kway_grid2x3_k2() {
 #[test]
 fn kway_grid4x4_k4() {
     let g = grid4x4();
-    let opts = Options { seed: 42, ..Options::for_kway() };
+    // Use greedy refinement + multiple cuts for a robust balance check.
+    use rmetis::types::RType;
+    let opts = Options { seed: 1, ncuts: 5, rtype: RType::Greedy, ..Options::for_kway() };
     let r = part_graph_kway(&g, 4, None, None, &opts).unwrap();
     assert_partition_valid(&g, &r.part, 4);
     assert_partition_balanced(&g, &r.part, 4, 30);

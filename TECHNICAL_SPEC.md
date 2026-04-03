@@ -1,6 +1,6 @@
 # rmetis 技术规范文档
 
-> 版本: 0.1.0 | 状态: 草稿 | 日期: 2026-04-02
+> 版本: 0.1.1 | 状态: 草稿 | 日期: 2026-04-03
 
 ## 1. 项目概述
 
@@ -10,7 +10,7 @@ rmetis 是一个纯 Rust 实现的图划分库，功能对标 METIS 5.1.x 和 Pa
 - 可编译为 WebAssembly (`wasm32-unknown-unknown`)
 - 兼容 METIS 的核心 API 语义
 - 支持 `no_std`（可选特性）
-- 单机多线程并行（替代 ParMETIS 的 MPI 模型）
+- MPI 级别分布式并行（ParMETIS 风格并行 ncuts、分布式粗化与细化）
 
 ---
 
@@ -63,7 +63,12 @@ rmetis 是一个纯 Rust 实现的图划分库，功能对标 METIS 5.1.x 和 Pa
 算法 SHEM-Coarsen(G):
   visited = [false; nvtxs]
   matching = [-1; nvtxs]
-  permutation = sort_by_degree_ascending(0..nvtxs)
+  
+  // 预先采样每个顶点的随机平局打破值（在排序前一次性生成）
+  // 注意：不能在 sort_by_key 闭包内调用 rng.gen()，
+  // 因为 sort_by_key 对同一元素会多次调用闭包，违反全序关系。
+  tiebreakers = [rng.gen::<u32>(); nvtxs]
+  permutation = sort_by_key(0..nvtxs, key = (degree(v), tiebreaker[v]))
   
   for v in permutation:
     if visited[v]: continue
@@ -179,13 +184,32 @@ gain[v] = (edges from v to other_part) - (edges from v to same_part)
 
 #### 2.4.2 贪心细化（Greedy Boundary Refinement）
 
+贪心细化分两个阶段：
+
+**阶段一：平衡修复 pass（balance-repair）**
+
+在切割优化循环之前先运行一次，将顶点从超重分区移出，即使移动不改善切割也允许执行：
+
+```
+算法 Balance-Repair(G, part, nparts, tpwgts, ubvec):
+  for v in boundary_vertices:
+    if source_partition(v) 不超重: continue
+    best_p = argmax_gain(v, dest in feasible_partitions)
+    // 可行性：移入后目标分区不超过 tpwgts[p] × ubvec 阈值
+    if best_p exists:
+      move(v, best_p)
+      update partition weights
+```
+
+**阶段二：切割优化 passes（niter 次迭代）**
+
 ```
 算法 Greedy-Refine(G, part, niter):
   for iter in 0..niter:
     improved = false
     for v in boundary_vertices:
-      best_part = argmax_gain_move(v)
-      if gain(v, best_part) > 0 and balance_satisfied(v, best_part):
+      best_part = argmax_gain(v, dest satisfying balance constraint)
+      if gain(v, best_part) > 0:
         move(v, best_part)
         improved = true
     if not improved: break
@@ -237,6 +261,78 @@ gain[v][p] = (edges from v to partition p) - (edges from v to current_part(v))
   ND-Order(G_left, perm, iperm)
   ND-Order(G_right, perm, iperm)
   assign_next(separator, perm, iperm)   // 分隔符排在最后
+```
+
+### 2.7 MPI 并行算法
+
+rmetis 通过 `Comm` trait 抽象 MPI 通信，支持三层并行：并行 ncuts、分布式粗化、分布式贪心细化。
+
+#### 2.7.1 并行 ncuts（Parallel ncuts）
+
+当 `comm.size() > 1` 时，将 `ncuts` 次独立尝试分发到各 MPI 进程：
+
+```
+算法 Parallel-ncuts(graph, nparts, ncuts, nprocs):
+  // 进程 r 处理尝试编号 r, r+P, r+2P, ...
+  for attempt in (rank .. ncuts).step_by(nprocs):
+    seed = base_seed + attempt
+    local_result = single_kway_attempt(graph, nparts, seed)
+  
+  // 全局归约：找最小边割
+  global_best_cut = all_reduce_min(local_best_cut)
+  
+  // 持有最优结果的进程将其 gather 到 rank 0，再 broadcast 给所有进程
+  winning_part = gather_then_broadcast(local_part if local_cut == global_best_cut)
+```
+
+#### 2.7.2 分布式粗化（Distributed Coarsening）
+
+每个进程只为其"拥有"的顶点（`v % nprocs == rank`）计算匹配，然后通过 `all_gather` 交换：
+
+```
+算法 Distributed-Coarsen(G, nprocs, rank):
+  // 独立计算本进程负责顶点的匹配建议
+  local_proposals = []
+  for v in 0..nvtxs where v % nprocs == rank:
+    best_u = argmax_weight_neighbor(v, unvisited)
+    if best_u found:
+      local_proposals.push((v, best_u))
+  
+  // 交换所有进程的建议
+  all_proposals = all_gather(local_proposals)
+  
+  // 冲突消解：按进程顺序处理，最小 rank 的建议优先
+  matching = identity_matching(nvtxs)
+  claimed = [false; nvtxs]
+  for rank_proposals in all_proposals:  // 按 rank 顺序
+    for (v, u) in rank_proposals:
+      if not claimed[v] and not claimed[u]:
+        matching[v] = u; matching[u] = v
+        claimed[v] = true; claimed[u] = true
+  
+  // 所有进程得到相同的 matching，本地构造粗化图
+  return build_coarse_graph(G, matching)
+```
+
+#### 2.7.3 分布式贪心细化（Distributed Greedy Refinement）
+
+边界顶点按 `v % nprocs == rank` 分配给各进程。每轮两个阶段（平衡修复 + 切割优化），均通过 `all_gather` 原子交换移动：
+
+```
+算法 Distributed-Greedy-Refine(G, part, nprocs, rank, niter):
+  // 平衡修复 pass
+  local_moves = propose_balance_repair_moves(rank)
+  all_moves = all_gather(local_moves)
+  apply_moves(all_moves)
+  sync_partition_weights()
+  
+  // 切割优化 passes
+  for iter in 0..niter:
+    local_moves = propose_cut_improving_moves(rank)
+    all_moves = all_gather(local_moves)
+    any_move = apply_moves(all_moves)
+    if not any_move: break
+    sync_partition_weights()
 ```
 
 ---
@@ -311,6 +407,50 @@ pub type Idx = i32;
 pub type Real = f32;
 ```
 
+### 3.6 MPI 通信抽象（`comm.rs`）
+
+```rust
+/// MPI 通信抽象 trait，统一屏蔽 SingleComm / jsmpi / mpi 后端的差异。
+/// 所有方法在单进程（SingleComm）下均为恒等操作或本地操作，无网络开销。
+pub trait Comm: Send + Sync {
+    /// 当前进程编号（0-based）
+    fn rank(&self) -> i32;
+    /// 总进程数
+    fn size(&self) -> i32;
+    /// 全局归约：取所有进程 local 中的最小值
+    fn all_reduce_min_i32(&self, local: Idx) -> Idx;
+    /// 全局归约（原位）：各进程对应元素求和，结果写回 out
+    fn all_reduce_sum_i32_slice(&self, local: &[Idx], out: &mut [Idx]);
+    /// 广播：rank root 将 data 广播给所有进程
+    fn broadcast_i32_vec(&self, root: i32, data: &mut Vec<Idx>);
+    /// 收集：各进程将 local 发往 root，root 返回 Vec<Vec<Idx>>
+    fn gather_i32_vec(&self, root: i32, local: &[Idx]) -> Vec<Vec<Idx>>;
+    /// 全量收集：每个进程收到所有进程的数据
+    fn all_gather_i32_vec(&self, local: &[Idx]) -> Vec<Vec<Idx>>;
+    /// 同步屏障
+    fn barrier(&self);
+}
+
+/// 无操作单进程实现（不依赖 MPI）
+pub struct SingleComm;
+
+/// 创建世界通信器（自动选择后端）：
+/// - wasm32 目标：使用 jsmpi 后端
+/// - 其他目标：使用 mpi crate 后端（OpenMPI / MPICH）
+/// - 若仅一个进程：返回 SingleComm（避免 MPI 初始化开销）
+pub fn world() -> Box<dyn Comm>;
+```
+
+**后端选择规则：**
+
+| 构建目标 | MPI 后端 | 说明 |
+|---------|---------|------|
+| `wasm32-*` | jsmpi（`vendor/jsmpi` 子模块） | Web Worker 间通信 |
+| 其他目标，`size > 1` | `mpi` crate 0.8（OpenMPI / MPICH） | 原生 MPI |
+| 其他目标，`size == 1` | `SingleComm`（no-op） | 无 MPI 开销 |
+
+**注意**：jsmpi 原生只支持 sum-reduce，`all_reduce_min` 在 jsmpi 后端通过 `gather + local-min + broadcast` 实现。
+
 ---
 
 ## 4. 公开 API 规范
@@ -327,13 +467,25 @@ pub fn part_graph_recursive(
     options: &Options,
 ) -> Result<PartitionResult, MetisError>;
 
-/// 多层 k-way 图划分
+/// 多层 k-way 图划分（串行，内部 comm = None）
 pub fn part_graph_kway(
     graph: &Graph,
     nparts: usize,
     tpwgts: Option<&[Real]>,
     ubvec: Option<&[Real]>,
     options: &Options,
+) -> Result<PartitionResult, MetisError>;
+
+/// 多层 k-way 图划分（MPI 并行版本）
+/// comm = Some(&world) 时启用并行 ncuts + 分布式细化
+/// comm = None 时退化为串行（等同于 part_graph_kway）
+pub fn partition_kway(
+    graph: &Graph,
+    nparts: usize,
+    tpwgts: Option<&[Real]>,
+    ubvec: Option<&[Real]>,
+    options: &Options,
+    comm: Option<&dyn Comm>,
 ) -> Result<PartitionResult, MetisError>;
 
 /// 嵌套剖分（稀疏矩阵填充减少排序）
@@ -590,12 +742,32 @@ std = ["thiserror/std", "rand/std"]
 - **平衡性验证**：每个分区权重不超过 `(1 + ufactor/1000) × target`
 - **连通性验证**（`contig=true` 时）：BFS 验证每分区连通
 - **NodeND 验证**：`perm` 和 `iperm` 互为逆置换
+- **MPI Comm 验证**：`SingleComm` 与显式 `SingleComm` 结果一致、`all_gather` 返回单行、广播为恒等操作
 
 ### 10.2 回归测试
 
 固定 `seed` 下，对标准数据集的边割数结果应确定性一致。
 
-### 10.3 Fuzz 测试
+### 10.3 并行测试（`tests/parallel.rs`）
+
+覆盖以下场景（均在 `SingleComm` 下运行，无需真实 MPI 环境）：
+
+| 测试 | 验证内容 |
+|------|---------|
+| `single_comm_rank_and_size` | `rank()==0, size()==1` |
+| `single_comm_all_reduce_min_is_identity` | 单进程 min = 原值 |
+| `single_comm_all_reduce_sum_slice_is_copy` | 单进程 sum = 原切片 |
+| `single_comm_gather_returns_single_row` | gather 返回 1 行 |
+| `single_comm_all_gather_returns_single_row` | all_gather 返回 1 行 |
+| `single_comm_broadcast_is_noop` | broadcast 不改变 data |
+| `greedy_refine_with_single_comm_matches_serial` | comm 版与串行版结果相同 |
+| `greedy_refine_with_comm_does_not_increase_cut` | 细化不增加切割数 |
+| `coarsen_with_single_comm_produces_valid_hierarchy` | 粗化层次结构合法 |
+| `partition_kway_with_explicit_single_comm_is_valid` | 显式 comm 划分合法 |
+| `partition_kway_with_none_comm_matches_explicit_single_comm` | None 等价于 SingleComm |
+| `partition_kway_parallel_ncuts_covers_all_attempts` | ncuts 尝试全部被执行 |
+
+### 10.4 Fuzz 测试
 
 使用 `cargo-fuzz` 对 CSR 输入进行模糊测试，验证不 panic、不越界。
 
@@ -609,13 +781,14 @@ rmetis/
 ├── src/
 │   ├── lib.rs              # 公开 API 导出
 │   ├── types.rs            # Idx, Real, Graph, Options, 错误类型
+│   ├── comm.rs             # MPI 通信抽象（Comm trait + SingleComm / jsmpi / mpi 后端）
 │   ├── graph/
 │   │   ├── mod.rs          # Graph 构造与验证
 │   │   └── validate.rs     # CSR 合法性检查
 │   ├── coarsen/
-│   │   ├── mod.rs          # 粗化框架
+│   │   ├── mod.rs          # 粗化框架（coarsen + coarsen_with_comm）
 │   │   ├── rm.rs           # 随机匹配
-│   │   └── shem.rs         # SHEM
+│   │   └── shem.rs         # SHEM（确定性平局打破）
 │   ├── initial/
 │   │   ├── mod.rs          # 初始划分调度
 │   │   ├── grow.rs         # 图增长法
@@ -624,20 +797,22 @@ rmetis/
 │   │   ├── mod.rs          # 细化框架
 │   │   ├── fm.rs           # FM 算法
 │   │   ├── fm_kway.rs      # K-way FM
-│   │   └── greedy.rs       # 贪心细化
+│   │   └── greedy.rs       # 贪心细化（greedy_refine + greedy_refine_with_comm）
 │   ├── partition/
 │   │   ├── mod.rs          # 划分入口
 │   │   ├── recursive.rs    # 递归二分
-│   │   ├── kway.rs         # K-way 划分
+│   │   ├── kway.rs         # K-way 划分（partition_kway，支持 comm 参数）
 │   │   └── nd.rs           # 嵌套剖分
 │   ├── separator/
 │   │   └── mod.rs          # 顶点分隔符算法（NodeND 用）
 │   └── ffi/
 │       ├── c_api.rs        # C ABI 兼容层（feature: c-api）
 │       └── wasm_api.rs     # WASM/JS 绑定（feature: wasm）
+├── vendor/
+│   └── jsmpi/              # git submodule — WASM 目标的 MPI 兼容层
 ├── tests/
-│   ├── correctness.rs
-│   ├── regression.rs
+│   ├── correctness.rs      # 算法正确性与回归测试
+│   ├── parallel.rs         # MPI 抽象与并行算法测试（基于 SingleComm）
 │   └── fixtures/           # 测试图数据文件
 └── benches/
     └── partition.rs
@@ -669,6 +844,14 @@ thiserror = { version = "1", default-features = false }
 wasm-bindgen = { version = "0.2", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
+
+# MPI 后端：wasm32 目标使用 jsmpi（git submodule at vendor/jsmpi）
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+jsmpi = { path = "vendor/jsmpi" }
+
+# MPI 后端：非 wasm32 目标使用 mpi crate（wraps OpenMPI / MPICH）
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+mpi = "0.8"
 
 [dev-dependencies]
 criterion = "0.5"
@@ -719,5 +902,6 @@ pub const METIS_NOPTIONS:         usize = 40;
 
 1. Karypis, G., & Kumar, V. (1998). A fast and high quality multilevel scheme for partitioning irregular graphs. *SIAM Journal on Scientific Computing*, 20(1), 359-392.
 2. Karypis, G., & Kumar, V. (1998). Multilevel k-way partitioning scheme for irregular graphs. *Journal of Parallel and Distributed Computing*, 48(1), 96-129.
-3. Karypis, G., & Kumar, V. (1998). A parallel algorithm for multilevel graph partitioning and sparse matrix ordering. *Journal of Parallel and Distributed Computing*, 48(1), 71-95.
-4. METIS 5.1.0 Manual: https://karypis.github.io/glaros/files/sw/metis/manual.pdf
+3. Karypis, G., Schloegel, K., & Kumar, V. (2003). *ParMETIS: Parallel Graph Partitioning and Sparse Matrix Ordering Library*. Technical Report, University of Minnesota.
+4. Karypis, G., & Kumar, V. (1998). A parallel algorithm for multilevel graph partitioning and sparse matrix ordering. *Journal of Parallel and Distributed Computing*, 48(1), 71-95.
+5. METIS 5.1.0 Manual: https://karypis.github.io/glaros/files/sw/metis/manual.pdf

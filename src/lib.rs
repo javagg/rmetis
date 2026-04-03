@@ -23,6 +23,7 @@
 //! ```
 
 pub mod coarsen;
+pub mod comm;
 pub mod ffi;
 pub mod graph;
 pub mod initial;
@@ -39,6 +40,17 @@ pub use types::{
 };
 
 // Re-export primary API functions
-pub use partition::kway::partition_kway as part_graph_kway;
 pub use partition::recursive::partition_recursive as part_graph_recursive;
 pub use partition::nd::node_nd;
+
+/// Partition `graph` into `nparts` partitions using the multilevel k-way scheme.
+/// Convenience wrapper that uses a single-process (no MPI) communicator.
+pub fn part_graph_kway(
+    graph: &graph::Graph,
+    nparts: usize,
+    tpwgts: Option<&[types::Real]>,
+    ubvec: Option<&[types::Real]>,
+    options: &types::Options,
+) -> Result<types::PartitionResult, types::MetisError> {
+    partition::kway::partition_kway(graph, nparts, tpwgts, ubvec, options, None)
+}

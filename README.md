@@ -1,6 +1,6 @@
 # rmetis
 
-Pure Rust graph partitioning library, targeting [METIS 5.1.x](https://karypis.github.io/glaros/software/metis/overview.html) API compatibility. Compiles to WebAssembly with no native dependencies.
+Pure Rust graph partitioning library, targeting [METIS 5.1.x](https://karypis.github.io/glaros/software/metis/overview.html) API compatibility. Compiles to WebAssembly with no native dependencies. Supports MPI-level distributed parallelism via [jsmpi](https://github.com/jsmpi/jsmpi) (WASM) and the [mpi](https://crates.io/crates/mpi) crate (native).
 
 ## Features
 
@@ -9,6 +9,7 @@ Pure Rust graph partitioning library, targeting [METIS 5.1.x](https://karypis.gi
 - **METIS-compatible** — same three core functions and option semantics as METIS 5.1.x
 - **Deterministic** — fixed seed produces identical results across platforms
 - **Multi-constraint** — supports balancing multiple weight dimensions simultaneously
+- **MPI parallel** — ParMETIS-style distributed parallelism: parallel ncuts, distributed coarsening, distributed greedy refinement
 
 ## Algorithms
 
@@ -16,7 +17,7 @@ Pure Rust graph partitioning library, targeting [METIS 5.1.x](https://karypis.gi
 |-------|---------|
 | Coarsening | Random Matching (RM), Sorted Heavy-Edge Matching (SHEM) |
 | Initial partitioning | Graph-growing (BFS), Random |
-| Refinement | Greedy boundary, Fiduccia-Mattheyses (FM), K-way FM |
+| Refinement | Greedy boundary (with balance-repair), Fiduccia-Mattheyses (FM), K-way FM |
 
 ## Quick Start
 
@@ -97,14 +98,52 @@ let options = Options {
 };
 ```
 
+### MPI parallel partitioning
+
+```rust
+use rmetis::comm;
+use rmetis::partition::kway::partition_kway;
+
+// Initialise the MPI world communicator (auto-selects backend)
+let world = comm::world();  // Box<dyn Comm>
+
+// With ncuts=8 and 4 MPI ranks, each rank handles 2 cut attempts.
+// The globally best partition is broadcast back to every rank.
+let options = Options { seed: 1, ncuts: 8, ..Options::for_kway() };
+let result = partition_kway(&graph, 4, None, None, &options, Some(world.as_ref()))?;
+```
+
+`comm::world()` returns a `SingleComm` (no-op) when only one process is present, so the same code works both serially and in parallel.
+
 ## Cargo Features
 
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `std` | ✓ | Standard library support |
 | `c-api` | | C ABI functions (`RMETIS_PartGraphKway`, etc.) |
-| `wasm` | | WebAssembly bindings via `wasm-bindgen` |
+| `wasm` | | WebAssembly bindings via `wasm-bindgen` + jsmpi MPI backend |
 | `parallel` | | Shared-memory parallelism via `rayon` |
+
+MPI support is automatic via target-conditional dependencies:
+
+| Target | MPI backend |
+|--------|-------------|
+| `wasm32-*` | [jsmpi](https://github.com/jsmpi/jsmpi) (git submodule at `vendor/jsmpi`) |
+| all others | [mpi](https://crates.io/crates/mpi) 0.8 (wraps OpenMPI / MPICH) |
+
+## Parallel Algorithms
+
+### Parallel ncuts
+
+When `comm.size() > 1`, the `ncuts` independent partition attempts are distributed across MPI ranks. Rank `r` handles attempts `r, r+P, r+2P, …` with different seeds. All ranks `all_reduce_min` the best edge cut and `broadcast` the winning partition.
+
+### Distributed coarsening
+
+Each rank computes a matching for its owned vertices (`v % P == rank`) independently. Proposals are exchanged via `all_gather`; conflicts (two ranks claiming the same vertex) are resolved by lowest-rank-wins. All ranks end up with the identical matching and build the coarse graph locally.
+
+### Distributed greedy refinement
+
+Boundary vertices are split across ranks (`v % P == rank`). Each rank runs a **balance-repair pass** first (moves vertices out of overweight partitions even at neutral gain), then a **cut-optimisation pass** (positive-gain moves only). After each pass all ranks exchange proposed moves via `all_gather` and apply them atomically.
 
 ## WebAssembly
 
@@ -194,20 +233,27 @@ Indicative timings on a single core (x86_64, release build):
 src/
 ├── lib.rs              # Public API
 ├── types.rs            # Types: Idx, Real, Options, MetisError
+├── comm.rs             # MPI comm abstraction (SingleComm / jsmpi / mpi)
 ├── graph/              # CSR graph structure and operations
-├── coarsen/            # RM and SHEM coarsening
+├── coarsen/            # RM and SHEM coarsening (serial + distributed)
 ├── initial/            # BFS-grow and random initial partitioning
-├── refine/             # Greedy, FM, and K-way FM refinement
-├── partition/          # kway, recursive bisection, NodeND
+├── refine/             # Greedy (with balance-repair), FM, and K-way FM
+├── partition/          # kway (parallel ncuts), recursive bisection, NodeND
 ├── separator/          # Vertex separator (used by NodeND)
 └── ffi/                # C ABI and WASM bindings
+vendor/
+└── jsmpi/              # Git submodule — MPI compatibility layer for WASM
+tests/
+├── correctness.rs      # Algorithm correctness and balance tests
+└── parallel.rs         # MPI abstraction and parallel algorithm tests
 ```
 
 ## References
 
 1. Karypis & Kumar (1998). *A fast and high quality multilevel scheme for partitioning irregular graphs.* SIAM J. Sci. Comput., 20(1).
 2. Karypis & Kumar (1998). *Multilevel k-way partitioning scheme for irregular graphs.* J. Parallel Distrib. Comput., 48(1).
-3. [METIS 5.1.0 Manual](https://karypis.github.io/glaros/files/sw/metis/manual.pdf)
+3. Karypis, Schloegel & Kumar (2003). *ParMETIS: Parallel Graph Partitioning and Sparse Matrix Ordering Library.* Technical Report.
+4. [METIS 5.1.0 Manual](https://karypis.github.io/glaros/files/sw/metis/manual.pdf)
 
 ## License
 

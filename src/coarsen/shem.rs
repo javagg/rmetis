@@ -15,13 +15,12 @@ pub fn shem_matching(graph: &Graph, rng: &mut impl Rng) -> Vec<usize> {
     let mut matching = (0..n).collect::<Vec<usize>>();
     let mut visited = vec![false; n];
 
-    // Sort vertices by ascending degree (ties broken randomly)
+    // Sort vertices by ascending degree (ties broken by pre-sampled random value)
     let mut perm: Vec<usize> = (0..n).collect();
-    // Stable sort by degree; add small random jitter to break ties
-    perm.sort_by_key(|&v| {
-        let deg = graph.degree(v);
-        (deg, rng.gen::<u32>() >> 16) // low 16 bits of random for tie-breaking
-    });
+    // Pre-generate one random tiebreaker per vertex to ensure the key function
+    // is deterministic (sort_by_key calls the closure multiple times per element).
+    let tiebreakers: Vec<u32> = (0..n).map(|_| rng.gen::<u32>() >> 16).collect();
+    perm.sort_by_key(|&v| (graph.degree(v), tiebreakers[v]));
 
     for &v in &perm {
         if visited[v] {

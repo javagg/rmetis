@@ -108,7 +108,7 @@ pub fn part_graph_kway(
     options: Option<WasmOptions>,
 ) -> Result<WasmPartitionResult, JsValue> {
     let opts = options.map(|o| o.inner).unwrap_or_default();
-    kway::partition_kway(&graph.inner, nparts, None, None, &opts)
+    kway::partition_kway(&graph.inner, nparts, None, None, &opts, None)
         .map(|r| WasmPartitionResult { part: r.part, objval: r.objval })
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
